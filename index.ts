@@ -9,6 +9,7 @@ const QUEST_WORD_PATTERN = /\bquests?\b/i;
 const QUEST_CONTEXT_PATTERN = /\b(promoted|orbs?|play now|share|rewards?|watch\s+\d+\s*(?:m|min|minutes?)|watch the video|get reward)\b/i;
 const QUEST_REWARD_PATTERN = /\b(?:\d+\s*)?orbs?\b/i;
 const PROMOTED_PATTERN = /\bpromoted\b/i;
+const PROMOTED_QUEST_PATTERN = /\b(?:avatar decoration|decorations?|unlock|with nitro|watch\s+\d+\s*(?:m|min|minutes?)|watch the video|get reward)\b/i;
 const REWARD_PATTERN = /\b(?:get|claim|collect)\s+rewards?!?\b/i;
 const WATCH_PATTERN = /\bwatch\s+\d+\s*(?:m|min|minutes?)\b|\bwatch the video\b/i;
 const WATCH_REWARD_PATTERN = /\bwatch\b.{0,100}\b(?:orbs?|reward|quest)\b/i;
@@ -35,6 +36,7 @@ let scanTimer: number | undefined;
 let intervalId: number | undefined;
 let startRetryId: number | undefined;
 let started = false;
+const pendingScanRoots = new Set<ParentNode>();
 
 function normalize(text: string) {
     return text.replace(/\s+/g, " ").trim();
@@ -87,8 +89,8 @@ function isQuestCardRoot(element: HTMLElement) {
 
     return width >= 240
         && height >= 80
-        && width <= Math.max(760, window.innerWidth * 0.8)
-        && height <= Math.max(540, window.innerHeight * 0.75);
+        && width <= Math.max(980, window.innerWidth * 0.95)
+        && height <= Math.max(560, window.innerHeight * 0.75);
 }
 
 function hasQuestAction(element: HTMLElement) {
@@ -119,20 +121,21 @@ function hasQuestCardSignal(element: HTMLElement) {
     return QUEST_TEXT_PATTERN.test(text) && (hasPromoted || hasAction || hasReward)
         || hasPromoted && hasQuestWord
         || hasPromoted && hasAction
+        || hasPromoted && PROMOTED_QUEST_PATTERN.test(text)
         || hasQuestWord && hasAction && (hasPromoted || hasReward);
 }
 
 function findHideTarget(element: HTMLElement) {
     let current: HTMLElement | null = element;
-    let target: HTMLElement | null = element;
+    let target: HTMLElement | null = null;
 
     for (let depth = 0; current && current !== document.body && depth < 18; depth++) {
         if (hasQuestSignal(current) && isReasonablePromoRoot(current)) {
-            target = current;
+            target ??= current;
         }
 
         if (hasQuestCardSignal(current) && isQuestCardRoot(current)) {
-            target = current;
+            target ??= current;
         }
 
         const text = getText(current);
@@ -176,6 +179,23 @@ function scan(root: ParentNode = document) {
     scanTextNodes(root);
 }
 
+function scanAncestors(root: Node) {
+    let current: HTMLElement | null = root instanceof HTMLElement
+        ? root
+        : root.parentNode instanceof HTMLElement ? root.parentNode : null;
+
+    for (let depth = 0; current && current !== document.body && depth < 18; depth++) {
+        if (current.hasAttribute(HIDDEN_ATTR)) return;
+
+        if (hasQuestSignal(current) || hasQuestCardSignal(current)) {
+            hide(current);
+            return;
+        }
+
+        current = current.parentElement;
+    }
+}
+
 function scanTextNodes(root: ParentNode = document) {
     const treeRoot = root instanceof Node ? root : document;
     const walker = document.createTreeWalker(
@@ -210,13 +230,25 @@ function scanTextNodes(root: ParentNode = document) {
     }
 }
 
-function scheduleScan() {
+function scheduleScan(root: ParentNode = document) {
+    pendingScanRoots.add(root);
+
     if (scanTimer != null) return;
 
     scanTimer = window.setTimeout(() => {
         scanTimer = undefined;
-        scan();
-    }, 50);
+
+        const roots = [...pendingScanRoots];
+        pendingScanRoots.clear();
+
+        for (const scanRoot of roots) {
+            scan(scanRoot);
+
+            if (scanRoot instanceof Node) {
+                scanAncestors(scanRoot);
+            }
+        }
+    }, 34);
 }
 
 function startScanning() {
@@ -245,12 +277,21 @@ function startScanning() {
         for (const mutation of mutations) {
             for (const node of mutation.addedNodes) {
                 if (node instanceof Element) {
-                    scheduleScan();
+                    scheduleScan(node);
+                } else if (node.parentNode instanceof HTMLElement) {
+                    scheduleScan(node.parentNode);
                 }
             }
 
             if (mutation.type === "attributes" || mutation.type === "characterData") {
-                scheduleScan();
+                const target = mutation.target;
+                const parent = target.parentNode;
+
+                if (target instanceof Element) {
+                    scheduleScan(target);
+                } else if (parent instanceof HTMLElement) {
+                    scheduleScan(parent);
+                }
             }
         }
     });
@@ -262,7 +303,7 @@ function startScanning() {
         characterData: true
     });
 
-    intervalId = window.setInterval(scan, 1000);
+    intervalId = window.setInterval(scan, 5000);
 }
 
 export default definePlugin({
@@ -294,6 +335,8 @@ export default definePlugin({
             window.clearTimeout(scanTimer);
             scanTimer = undefined;
         }
+
+        pendingScanRoots.clear();
 
         if (intervalId != null) {
             window.clearInterval(intervalId);
