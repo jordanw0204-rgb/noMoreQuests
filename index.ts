@@ -1,13 +1,14 @@
 import definePlugin, { StartAt } from "@utils/types";
-import { RestAPI } from "@webpack/common";
+import { FluxDispatcher, RestAPI } from "@webpack/common";
 
 import managedStyle from "./style.css?managed";
 
 const HIDDEN_ATTR = "data-vc-no-more-quests-hidden";
 const QUEST_ACTION_SELECTOR = "button,[role='button'],a";
-const QUEST_ACTION_PATTERN = /\b(?:watch\s*\d+\s*(?:m|min|minutes?)|watch the video|get reward|claim reward|start video quest|accept quest)\b/i;
+const QUEST_ACTION_PATTERN = /\b(?:watch\s*\d+\s*(?:s|sec|secs|seconds?|m|min|minutes?)|watch the video|get reward|claim reward|start video quest|accept quest)\b/i;
 const QUEST_CARD_PATTERN = /\b(?:promoted|quests?|avatar decoration|decorations?|with nitro|orbs?|reward)\b/i;
 const QUEST_STRONG_CARD_PATTERN = /\b(?:promoted|quests?)\b/i;
+const QUEST_DELIVERY_PLACEMENTS = [1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 15, 18];
 
 let observer: MutationObserver | null = null;
 let scanTimer: number | undefined;
@@ -18,10 +19,14 @@ let burstScanCount = 0;
 let started = false;
 const pendingScanRoots = new Set<ParentNode>();
 let originalFetch: typeof window.fetch | null = null;
+let originalDispatch: typeof FluxDispatcher.dispatch | null = null;
 const originalRestMethods = new Map<keyof typeof RestAPI, typeof RestAPI[keyof typeof RestAPI]>();
 const restMethods = ["get", "post", "put", "patch"] as const;
 
 const emptyQuestDecisionBody = {
+    request_id: "vc-no-more-quests",
+    response_ttl_seconds: 86400,
+    creative: null,
     decisions: [],
     quest_decisions: [],
     quests: [],
@@ -30,8 +35,71 @@ const emptyQuestDecisionBody = {
     ad_id: null,
     ad_identifiers: null,
     ad_context: null,
+    metadata_sealed: null,
+    traffic_metadata_sealed: null,
     metadata_raw: null
 };
+
+function makeEmptyQuestDeliveryAction(placement: number) {
+    return {
+        type: "QUESTS_FETCH_QUEST_TO_DELIVER_SUCCESS",
+        quest: null,
+        placement,
+        fetchedAt: Date.now(),
+        responseTtlSeconds: 86400,
+        adDecisionData: null,
+        adContext: null,
+        metadataSealed: null,
+        trafficMetadataSealed: null
+    };
+}
+
+function sanitizeQuestAction(action: any) {
+    if (!action || typeof action.type !== "string") return action;
+
+    switch (action.type) {
+        case "QUESTS_FETCH_QUEST_TO_DELIVER_SUCCESS":
+            return {
+                ...action,
+                quest: null,
+                adDecisionData: null,
+                adContext: null,
+                metadataSealed: null,
+                trafficMetadataSealed: null,
+                responseTtlSeconds: Math.max(action.responseTtlSeconds ?? 0, 86400)
+            };
+        case "QUESTS_FETCH_EARNED_QUEST_TO_DELIVER_SUCCESS":
+            return {
+                ...action,
+                serverQuests: new Map(),
+                responseTtlSeconds: Math.max(action.responseTtlSeconds ?? 0, 86400)
+            };
+        default:
+            return action;
+    }
+}
+
+function patchFluxDispatcher() {
+    if (originalDispatch) return;
+
+    originalDispatch = FluxDispatcher.dispatch.bind(FluxDispatcher);
+    FluxDispatcher.dispatch = ((action: any, ...args: any[]) => {
+        return (originalDispatch as any)(sanitizeQuestAction(action), ...args);
+    }) as typeof FluxDispatcher.dispatch;
+}
+
+function unpatchFluxDispatcher() {
+    if (!originalDispatch) return;
+
+    FluxDispatcher.dispatch = originalDispatch;
+    originalDispatch = null;
+}
+
+function clearDeliveredQuests() {
+    for (const placement of QUEST_DELIVERY_PLACEMENTS) {
+        FluxDispatcher.dispatch(makeEmptyQuestDeliveryAction(placement) as any);
+    }
+}
 
 function getRequestUrl(input: RequestInfo | URL) {
     if (typeof input === "string") return input;
@@ -253,6 +321,8 @@ function startScanning() {
 
     patchFetch();
     patchRestAPI();
+    patchFluxDispatcher();
+    clearDeliveredQuests();
 
     started = true;
     scan();
@@ -291,10 +361,21 @@ export default definePlugin({
     requiresRestart: false,
     managedStyle,
     startAt: StartAt.WebpackReady,
+    patches: [
+        {
+            find: "QuestActionCreators.fetchQuestToDeliver",
+            replacement: {
+                match: /(async function \i\((\i),\i\)\{)/,
+                replace: "$1return $self.dispatchNoQuestDelivery($2);"
+            }
+        }
+    ],
 
     start() {
         patchFetch();
         patchRestAPI();
+        patchFluxDispatcher();
+        clearDeliveredQuests();
         startScanning();
     },
 
@@ -302,6 +383,7 @@ export default definePlugin({
         started = false;
         unpatchFetch();
         unpatchRestAPI();
+        unpatchFluxDispatcher();
 
         if (startRetryId != null) {
             window.clearTimeout(startRetryId);
@@ -336,5 +418,9 @@ export default definePlugin({
             element.style.removeProperty("visibility");
             element.style.removeProperty("pointer-events");
         }
+    },
+
+    dispatchNoQuestDelivery(placement: number) {
+        FluxDispatcher.dispatch(makeEmptyQuestDeliveryAction(placement) as any);
     }
 });

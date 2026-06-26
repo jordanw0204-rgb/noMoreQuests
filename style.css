@@ -2,6 +2,7 @@ a[data-list-item-id$="___quests"],
 a[data-list-item-id*="quests" i],
 a[href="/quests" i],
 a[href*="/quests" i],
+[data-testid*="quest-bar" i],
 [data-vc-no-more-quests-hidden="true"] {
     display: none !important;
     visibility: hidden !important;
