@@ -1,4 +1,5 @@
 import definePlugin, { StartAt } from "@utils/types";
+import { RestAPI } from "@webpack/common";
 
 import managedStyle from "./style.css?managed";
 
@@ -16,6 +17,109 @@ let burstScanId: number | undefined;
 let burstScanCount = 0;
 let started = false;
 const pendingScanRoots = new Set<ParentNode>();
+let originalFetch: typeof window.fetch | null = null;
+const originalRestMethods = new Map<keyof typeof RestAPI, typeof RestAPI[keyof typeof RestAPI]>();
+const restMethods = ["get", "post", "put", "patch"] as const;
+
+const emptyQuestDecisionBody = {
+    decisions: [],
+    quest_decisions: [],
+    quests: [],
+    decision: null,
+    quest: null,
+    ad_id: null,
+    ad_identifiers: null,
+    ad_context: null,
+    metadata_raw: null
+};
+
+function getRequestUrl(input: RequestInfo | URL) {
+    if (typeof input === "string") return input;
+    if (input instanceof URL) return input.href;
+
+    return input.url;
+}
+
+function isQuestDecisionUrl(url: string) {
+    try {
+        const pathname = new URL(url, window.location.href).pathname;
+
+        return /^\/api\/v\d+\/quests\/(?:decision|get-decisions)$/i.test(pathname);
+    } catch {
+        return false;
+    }
+}
+
+function shouldBlockFetch(input: RequestInfo | URL) {
+    return isQuestDecisionUrl(getRequestUrl(input));
+}
+
+function makeFetchQuestDecisionResponse() {
+    return new Response(JSON.stringify(emptyQuestDecisionBody), {
+        status: 200,
+        statusText: "OK",
+        headers: {
+            "content-type": "application/json",
+            "x-vc-no-more-quests": "true"
+        }
+    });
+}
+
+function patchFetch() {
+    if (originalFetch) return;
+
+    originalFetch = window.fetch.bind(window);
+    window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        if (shouldBlockFetch(input)) {
+            return Promise.resolve(makeFetchQuestDecisionResponse());
+        }
+
+        return originalFetch!(input, init);
+    }) as typeof window.fetch;
+}
+
+function unpatchFetch() {
+    if (!originalFetch) return;
+
+    window.fetch = originalFetch;
+    originalFetch = null;
+}
+
+function getRestRequestUrl(data: unknown) {
+    if (typeof data === "string") return data;
+    if (data && typeof data === "object" && "url" in data && typeof data.url === "string") {
+        return data.url;
+    }
+
+    return null;
+}
+
+function patchRestAPI() {
+    if (originalRestMethods.size > 0) return;
+
+    for (const method of restMethods) {
+        const originalMethod = RestAPI[method];
+        originalRestMethods.set(method, originalMethod);
+
+        RestAPI[method] = ((data: Parameters<typeof originalMethod>[0]) => {
+            const url = getRestRequestUrl(data);
+
+            if (url && isQuestDecisionUrl(url)) {
+                return Promise.resolve({ body: emptyQuestDecisionBody, ok: true, status: 200 });
+            }
+
+            return originalMethod(data);
+        }) as typeof originalMethod;
+    }
+}
+
+function unpatchRestAPI() {
+    for (const [method, originalMethod] of originalRestMethods) {
+        RestAPI[method] = originalMethod;
+    }
+
+    originalRestMethods.clear();
+}
 
 function normalize(text: string) {
     return text.replace(/\s+/g, " ").trim();
@@ -147,6 +251,9 @@ function startScanning() {
         startRetryId = undefined;
     }
 
+    patchFetch();
+    patchRestAPI();
+
     started = true;
     scan();
     startBurstScan();
@@ -186,11 +293,15 @@ export default definePlugin({
     startAt: StartAt.WebpackReady,
 
     start() {
+        patchFetch();
+        patchRestAPI();
         startScanning();
     },
 
     stop() {
         started = false;
+        unpatchFetch();
+        unpatchRestAPI();
 
         if (startRetryId != null) {
             window.clearTimeout(startRetryId);
